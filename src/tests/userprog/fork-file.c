@@ -16,16 +16,16 @@ void test_main(void) {
   pid_t pid = fork();
   if (pid < 0)
     fail("fork returned %d", pid);
-  
+
   memset(buf, 'b', 24);
   if (pid == 0) {
     memset(buf, 'a', 24);
     unsigned total_written = 0;
-    while (total_written < 24) { 
-        int written = write(fd, buf + total_written, 24 - total_written);
-        if (written == -1)
-          fail("failed to write");
-        total_written += written;
+    while (total_written < 24) {
+      int written = write(fd, buf + total_written, 24 - total_written);
+      if (written == -1)
+        fail("failed to write");
+      total_written += written;
     }
     close(fd);
     exit(0);

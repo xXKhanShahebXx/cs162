@@ -16,7 +16,7 @@ void test_main(void) {
   pid_t pid = fork();
   if (pid < 0)
     fail("fork returned %d", pid);
-  
+
   if (pid == 0) {
     int new_fd;
     CHECK((new_fd = open("new.txt")) != fd, "file descriptors should be distinct");
@@ -27,7 +27,7 @@ void test_main(void) {
     CHECK(read(fd, buf, 10) == -1, "You should not be able to read from a closed FD");
     exit(0);
   }
-  
+
   int new_new_fd;
   CHECK((new_new_fd = open("new.txt")) != fd, "file descriptors should be distinct");
   close(fd);
