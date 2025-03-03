@@ -69,10 +69,67 @@ pid_t process_execute(const char* file_name) {
   return tid;
 }
 
+static void load_stack(void** esp, char* file_name, char* save_ptr) {
+  uint8_t* stack = *esp;
+  if (save_ptr) {
+    int arg_length = strlen(save_ptr);
+    stack -= arg_length + 1;
+    strlcpy((char*)stack, save_ptr, arg_length + 1);
+    save_ptr = (char*)stack;
+  }
+
+  int file_name_length = strlen(file_name);
+  stack -= file_name_length + 1;
+  strlcpy((char*)stack, file_name, file_name_length + 1);
+  file_name = (char*)stack;
+
+  int arg_number;
+  if (!save_ptr) {
+    arg_number = 1;
+  }
+  int temp = 0;
+  bool next = true;
+  for (size_t i = 0; i < strlen(save_ptr); i++) {
+    if (save_ptr[i] == ' ') {
+      next = true;
+    } else if (next) {
+      temp++;
+      next = false;
+    }
+  }
+  arg_number = temp + 1;
+
+  int arg_bytes = (arg_number + 1) * 4 + 4 + 4;
+
+  stack -= arg_bytes;
+  stack = (uint8_t*)((uint32_t)stack & ~15);
+
+  stack -= 4;
+  *esp = stack;
+
+  memset(stack, 0, arg_bytes + 4);
+  stack += 4;
+
+  *((uint32_t*)stack) = (uint32_t)arg_number;
+  stack += sizeof(int);
+  *((uint32_t*)stack) = (uint32_t)(stack + 4);
+  stack += sizeof(char**);
+  *((uint32_t*)stack) = (uint32_t)file_name;
+  stack += sizeof(char*);
+  if (save_ptr) {
+    for (char* token = strtok_r(NULL, " ", &save_ptr); token != NULL;
+         token = strtok_r(NULL, " ", &save_ptr)) {
+      *((uint32_t*)stack) = (uint32_t)token;
+      stack += sizeof(char*);
+    }
+  }
+}
+
 /* A thread function that loads a user process and starts it
    running. */
 static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+  char* save_ptr;
+  char* file_name = strtok_r((char*)file_name_, " ", &save_ptr);
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
@@ -100,6 +157,10 @@ static void start_process(void* file_name_) {
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
     success = load(file_name, &if_.eip, &if_.esp);
+  }
+
+  if (success) {
+    load_stack(&if_.esp, file_name, save_ptr);
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
