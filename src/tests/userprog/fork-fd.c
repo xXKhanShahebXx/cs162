@@ -34,6 +34,7 @@ void test_main(void) {
   close(new_new_fd);
   CHECK(read(new_new_fd, buf, 10) == -1, "You should not be able to read from a closed FD");
   CHECK(read(fd, buf, 10) == -1, "You should not be able to read from a closed FD");
+  wait(pid);
 
   quiet = false;
 }
