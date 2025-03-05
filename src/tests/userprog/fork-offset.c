@@ -17,7 +17,7 @@ void test_main(void) {
   pid_t pid = fork();
   if (pid < 0)
     fail("fork returned %d", pid);
-  
+
   if (pid == 0) {
     int second_fd;
     CHECK((second_fd = open("second.txt")) >= 2, "open() returned %d", second_fd);
