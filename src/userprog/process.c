@@ -20,6 +20,17 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+/* Page-directory and page-table constants. */
+#define PDSHIFT 22 /* Log2(PTSIZE) */
+#define PTSHIFT 12 /* Log2(PGSIZE) */
+#define PTBITS 10  /* Log2(PTSIZE/PGSIZE) */
+
+/* Page table/directory entry flags. */
+#define PTE_P 0x001         /* Present */
+#define PTE_W 0x002         /* Writable */
+#define PTE_U 0x004         /* User */
+#define PTE_ADDR 0xfffff000 /* Physical address (mask) */
+
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
@@ -46,6 +57,13 @@ void userprog_init(void) {
   ASSERT(success);
 }
 
+struct start_data {
+  struct semaphore load;
+  char* file_name;
+  bool has_exec;
+  struct list* children;
+};
+
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
@@ -54,7 +72,6 @@ pid_t process_execute(const char* file_name) {
   char* fn_copy;
   tid_t tid;
 
-  sema_init(&temporary, 0);
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page(0);
@@ -62,24 +79,62 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
+  size_t offset = 0;
+  while (file_name[offset] != ' ' && file_name[offset] != '\0') {
+    offset++;
+  }
+  char* program_name = malloc(sizeof(char) * (offset + 1));
+  strlcpy(program_name, file_name, offset + 1);
+
+  struct start_data start_data;
+  start_data.file_name = fn_copy;
+  sema_init(&(start_data.load), 0);
+  start_data.children = &(thread_current()->pcb->children);
+  start_data.has_exec = thread_current()->pcb->has_exec;
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create(program_name, PRI_DEFAULT, start_process, &start_data);
+
+  sema_down(&(start_data.load));
+
   if (tid == TID_ERROR)
     palloc_free_page(fn_copy);
+
+  struct shared_data* shared_data = find_shared_data(&(thread_current()->pcb->children), tid);
+  if (shared_data == NULL) {
+    return -1;
+  }
+
+  if (!(shared_data->loaded)) {
+    list_pop_front(start_data.children);
+    free(shared_data);
+    return -1;
+  }
+
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+static void start_process(void* start_data) {
+  struct start_data* child_data = (struct start_data*)start_data;
+  char* file_name = (char*)child_data->file_name;
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
+  bool fd_success;
+  bool shared_data_success;
 
   /* Allocate process control block */
-  struct process* new_pcb = malloc(sizeof(struct process));
-  success = pcb_success = new_pcb != NULL;
+  struct process* new_pcb = calloc(sizeof(struct process), 1);
+  struct fd_table* new_fd = calloc(sizeof(struct fd_table), 1);
+  struct shared_data* new_shared_data = calloc(sizeof(struct shared_data), 1);
+
+  pcb_success = new_pcb != NULL;
+  fd_success = new_fd != NULL;
+  shared_data_success = new_shared_data != NULL;
+
+  success = pcb_success && fd_success && shared_data_success;
 
   /* Initialize process control block */
   if (success) {
@@ -88,10 +143,45 @@ static void start_process(void* file_name_) {
     new_pcb->pagedir = NULL;
     t->pcb = new_pcb;
 
+    init_table(new_fd);
+    list_init(&(new_pcb)->children);
+    init_shared_data(new_shared_data);
+
+    new_pcb->fd_table = new_fd;
+    new_pcb->shared_data = new_shared_data;
+    new_pcb->is_forked_child = false;
+
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    if (!(child_data->has_exec)) {
+      list_init(child_data->children);
+    }
+    list_push_front(child_data->children, &(new_shared_data->elem));
+    new_pcb->has_exec = true;
   }
+
+  char* token;
+  char* save_ptr;
+  int argc = 0;
+  char* temp = calloc(strlen(file_name) + 1, 1);
+  strlcpy(temp, file_name, strlen(file_name) + 1);
+
+  for (token = strtok_r(temp, " ", &save_ptr); token != NULL;
+       token = strtok_r(NULL, " ", &save_ptr)) {
+    argc++;
+  }
+
+  free(temp);
+
+  char* argv[argc + 1];
+  argc = 0;
+  for (token = strtok_r(file_name, " ", &save_ptr); token != NULL;
+       token = strtok_r(NULL, " ", &save_ptr)) {
+    argv[argc++] = token;
+  }
+
+  argv[argc] = NULL;
 
   /* Initialize interrupt frame and load executable. */
   if (success) {
@@ -99,7 +189,47 @@ static void start_process(void* file_name_) {
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+    success = load(argv[0], &if_.eip, &if_.esp);
+    new_shared_data->loaded = success;
+  }
+
+  if (success) {
+    char* argv_ptr[argc];
+    for (int i = 0; i < argc; i++) {
+      if_.esp = if_.esp - (strlen(argv[i]) + 1);
+      argv_ptr[i] = (char*)if_.esp;
+      memcpy(if_.esp, argv[i], strlen(argv[i]) + 1);
+    }
+    uint32_t offset = (uint32_t)(if_.esp - ((uint32_t)argc + 3) * 4) % 16;
+    if_.esp = if_.esp - offset;
+    memset(if_.esp, 0, offset);
+
+    if_.esp = if_.esp - sizeof(char*);
+    memset(if_.esp, argv[argc], sizeof(char*));
+
+    for (int i = 0; i < argc; i++) {
+      if_.esp = if_.esp - sizeof(char*);
+      *(int*)if_.esp = (uint32_t)argv_ptr[argc - i - 1];
+    }
+
+    if_.esp = if_.esp - sizeof(char*);
+    char* prev = (char*)(if_.esp + (uint32_t)4);
+    memcpy(if_.esp, &prev, sizeof(char*));
+
+    if_.esp = if_.esp - sizeof(int);
+    memset(if_.esp, argc, sizeof(int));
+    *(int*)if_.esp = argc;
+
+    if_.esp = if_.esp - sizeof(void*);
+    memset(if_.esp, '\0', sizeof(void*));
+  }
+
+  if (!success && fd_success) {
+    free_table(t->pcb->fd_table);
+  }
+
+  if (!success && shared_data_success) {
+    new_shared_data->ref_count--;
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
@@ -112,10 +242,11 @@ static void start_process(void* file_name_) {
     free(pcb_to_free);
   }
 
+  sema_up(&(child_data->load));
+
   /* Clean up. Exit on failure or jump to userspace */
   palloc_free_page(file_name);
   if (!success) {
-    sema_up(&temporary);
     thread_exit();
   }
 
@@ -139,8 +270,20 @@ static void start_process(void* file_name_) {
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int process_wait(pid_t child_pid UNUSED) {
-  sema_down(&temporary);
-  return 0;
+  struct process* parent = thread_current()->pcb;
+  struct shared_data* shared_data = find_shared_data(&(parent->children), child_pid);
+  if (shared_data == NULL) {
+    return -1;
+  }
+  if (shared_data->waited) {
+    return -1;
+  }
+  shared_data->waited = true;
+  if (shared_data->ref_count == 1) {
+    return shared_data->exit_code;
+  }
+  sema_down(&(shared_data->wait));
+  return shared_data->exit_code;
 }
 
 /* Free the current process's resources. */
@@ -175,11 +318,324 @@ void process_exit(void) {
      If this happens, then an unfortuantely timed timer interrupt
      can try to activate the pagedir, but it is now freed memory */
   struct process* pcb_to_free = cur->pcb;
+
+  sema_up(&(pcb_to_free->shared_data->wait));
+  free_table(pcb_to_free->fd_table);
+  if (pcb_to_free->executable != NULL) {
+    file_allow_write(pcb_to_free->executable);
+    if (!pcb_to_free->is_forked_child) {
+      file_close(pcb_to_free->executable);
+    }
+  }
+
+  if (!list_empty(&(pcb_to_free->children))) {
+    struct list_elem* e;
+    struct list* children = &(pcb_to_free->children);
+    for (e = list_begin(children); e != list_end(children); e = list_next(e)) {
+      struct shared_data* shared_data = list_entry(e, struct shared_data, elem);
+      if (shared_data != NULL) {
+        shared_data->ref_count = shared_data->ref_count - 1;
+      }
+    }
+  }
+
+  if (pcb_to_free->shared_data != NULL) {
+    sema_up(&(pcb_to_free->shared_data->wait));
+    pcb_to_free->shared_data->ref_count--;
+    if (pcb_to_free->shared_data->ref_count == 0) {
+      free(pcb_to_free->shared_data);
+    }
+  }
+
   cur->pcb = NULL;
   free(pcb_to_free);
-
-  sema_up(&temporary);
   thread_exit();
+}
+
+struct fork_data {
+  struct thread* parent;
+  struct semaphore sema;
+  bool success;
+};
+
+pid_t process_fork(void) {
+  struct thread* current = thread_current();
+  char thread_name[16];
+
+  strlcpy(thread_name, current->name, sizeof thread_name);
+
+  struct fork_data fork_data;
+  fork_data.parent = current;
+  sema_init(&fork_data.sema, 0);
+  fork_data.success = false;
+
+  tid_t tid = thread_create(thread_name, PRI_DEFAULT, start_fork_process, &fork_data);
+
+  if (tid == TID_ERROR)
+    return -1;
+
+  sema_down(&fork_data.sema);
+
+  if (!fork_data.success)
+    return -1;
+
+  return tid;
+}
+
+static void start_fork_process(void* aux) {
+  struct fork_data* fork_data = (struct fork_data*)aux;
+  struct thread* parent = fork_data->parent;
+  struct thread* child = thread_current();
+  bool success = false;
+
+  child->pcb = calloc(sizeof(struct process), 1);
+  if (child->pcb == NULL)
+    goto done;
+
+  child->pcb->pagedir = NULL;
+  child->pcb->main_thread = child;
+  strlcpy(child->pcb->process_name, child->name, sizeof child->name);
+  child->pcb->is_forked_child = true;
+
+  child->pcb->fd_table = calloc(sizeof(struct fd_table), 1);
+  if (child->pcb->fd_table == NULL)
+    goto done;
+  init_table(child->pcb->fd_table);
+
+  list_init(&child->pcb->children);
+  child->pcb->has_exec = true;
+
+  struct shared_data* shared_data = calloc(sizeof(struct shared_data), 1);
+  if (shared_data == NULL)
+    goto done;
+  init_shared_data(shared_data);
+  child->pcb->shared_data = shared_data;
+
+  list_push_front(&parent->pcb->children, &shared_data->elem);
+
+  child->pcb->pagedir = pagedir_create();
+  if (child->pcb->pagedir == NULL)
+    goto done;
+
+  process_activate();
+
+  if (!copy_page_directory(parent->pcb->pagedir, child->pcb->pagedir))
+    goto done;
+
+  struct list_elem* e;
+  for (e = list_begin(&parent->pcb->fd_table->fds); e != list_end(&parent->pcb->fd_table->fds);
+       e = list_next(e)) {
+    struct fd* parent_fd = list_entry(e, struct fd, list_fd);
+
+    struct file* parent_file = parent_fd->file;
+    off_t parent_pos = file_tell(parent_file);
+
+    struct file* child_file = file_dup(parent_file);
+    if (child_file == NULL) {
+      success = false;
+      goto done;
+    }
+
+    char* name_copy = NULL;
+    if (parent_fd->file_name != NULL) {
+      name_copy = malloc(strlen(parent_fd->file_name) + 1);
+      if (name_copy == NULL) {
+        file_close(child_file);
+        success = false;
+        goto done;
+      }
+      strlcpy(name_copy, parent_fd->file_name, strlen(parent_fd->file_name) + 1);
+    }
+
+    struct fd* child_fd = add_fd(child->pcb->fd_table, child_file, name_copy);
+    if (child_fd == NULL) {
+      file_close(child_file);
+      if (name_copy != NULL)
+        free(name_copy);
+      success = false;
+      goto done;
+    }
+    child_fd->fd_num = parent_fd->fd_num;
+  }
+
+  if (parent->pcb->executable != NULL) {
+    child->pcb->executable = file_reopen(parent->pcb->executable);
+    if (child->pcb->executable != NULL) {
+      file_deny_write(child->pcb->executable);
+    } else {
+      success = false;
+      goto done;
+    }
+  }
+
+  child->pcb->fd_table->next_fd = parent->pcb->fd_table->next_fd;
+
+  struct intr_frame if_;
+  memcpy(&if_, &parent->pcb->if_save, sizeof(struct intr_frame));
+  if_.eax = 0;
+
+  success = true;
+
+done:
+  fork_data->success = success;
+  sema_up(&fork_data->sema);
+
+  if (!success) {
+    if (child->pcb != NULL) {
+      if (child->pcb->fd_table != NULL) {
+        struct list_elem* e;
+        for (e = list_begin(&child->pcb->fd_table->fds);
+             e != list_end(&child->pcb->fd_table->fds);) {
+          struct fd* fd = list_entry(e, struct fd, list_fd);
+          e = list_next(e);
+          file_close(fd->file);
+          free(fd);
+        }
+        free(child->pcb->fd_table);
+      }
+      if (child->pcb->pagedir != NULL)
+        pagedir_destroy(child->pcb->pagedir);
+      if (child->pcb->shared_data != NULL) {
+        list_remove(&child->pcb->shared_data->elem);
+        free(child->pcb->shared_data);
+      }
+      if (child->pcb->executable != NULL) {
+        file_allow_write(child->pcb->executable);
+        file_close(child->pcb->executable);
+      }
+      free(child->pcb);
+    }
+    thread_exit();
+  }
+
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+  NOT_REACHED();
+}
+
+static bool copy_page_directory(uint32_t* src_pd, uint32_t* dst_pd) {
+  int i, j;
+
+  for (i = 0; i < 1024; i++) {
+    uint32_t pde = src_pd[i];
+    if ((pde & PTE_P) == 0)
+      continue;
+
+    uint32_t* pt = pde_get_pt(pde);
+
+    for (j = 0; j < 1024; j++) {
+      uint32_t pte = pt[j];
+      if ((pte & PTE_P) == 0)
+        continue;
+
+      void* upage = (void*)((i << 22) | (j << 12));
+
+      if (!is_user_vaddr(upage))
+        continue;
+
+      void* kpage = pagedir_get_page(src_pd, upage);
+      if (kpage == NULL)
+        continue;
+
+      void* new_kpage = palloc_get_page(PAL_USER);
+      if (new_kpage == NULL)
+        return false;
+
+      memcpy(new_kpage, kpage, PGSIZE);
+
+      bool writable = (pte & PTE_W) != 0;
+
+      if (!pagedir_set_page(dst_pd, upage, new_kpage, writable)) {
+        palloc_free_page(new_kpage);
+        return false;
+      }
+
+      if (pagedir_is_dirty(src_pd, upage))
+        pagedir_set_dirty(dst_pd, upage, true);
+      if (pagedir_is_accessed(src_pd, upage))
+        pagedir_set_accessed(dst_pd, upage, true);
+    }
+  }
+
+  return true;
+}
+
+static uint32_t* pde_get_pt(uint32_t pde) { return ptov(pde & PTE_ADDR); }
+
+void init_table(struct fd_table* fd_table) {
+  struct list* fds = &(fd_table->fds);
+  list_init(fds);
+  fd_table->fds = *fds;
+  fd_table->next_fd = 2;
+}
+
+void free_table(struct fd_table* fd_table) {
+  struct list_elem* e;
+  while (!list_empty(&(fd_table->fds))) {
+    e = list_pop_front(&(fd_table->fds));
+    struct fd* file_descriptor = list_entry(e, struct fd, list_fd);
+    if (!thread_current()->pcb->is_forked_child) {
+      file_close(file_descriptor->file);
+    }
+
+    free(file_descriptor);
+  }
+  free(fd_table);
+}
+
+struct fd* find_fd(struct fd_table* fd_table, int fd_num) {
+  struct list_elem* e;
+  for (e = list_begin(&(fd_table->fds)); e != list_end(&(fd_table->fds)); e = list_next(e)) {
+    struct fd* file_descriptor = list_entry(e, struct fd, list_fd);
+    if (file_descriptor != NULL && file_descriptor->fd_num == fd_num) {
+      return file_descriptor;
+    }
+  }
+  return NULL;
+}
+
+struct fd* add_fd(struct fd_table* fd_table, struct file* file, char* file_name) {
+  if (file == NULL || fd_table == NULL) {
+    return NULL;
+  }
+  struct fd* file_descriptor = calloc(sizeof(struct fd), 1);
+  struct list_elem* e = &(file_descriptor->list_fd);
+  file_descriptor->fd_num = fd_table->next_fd;
+  file_descriptor->file = file;
+  file_descriptor->file_name = file_name;
+  fd_table->next_fd++;
+  list_push_back(&(fd_table->fds), e);
+  return file_descriptor;
+}
+
+int remove_fd(struct fd_table* fd_table, int fd) {
+  struct fd* file_descriptor = find_fd(fd_table, fd);
+  if (file_descriptor == NULL) {
+    return -1;
+  }
+  struct list_elem* e = &(file_descriptor->list_fd);
+  list_remove(e);
+  free(file_descriptor);
+  return 0;
+}
+
+void init_shared_data(struct shared_data* shared_data) {
+  shared_data->ref_count = 2;
+  shared_data->exit_code = 0;
+  shared_data->waited = false;
+  shared_data->loaded = false;
+  sema_init(&(shared_data->wait), 0);
+  shared_data->pid = thread_current()->tid;
+}
+
+struct shared_data* find_shared_data(struct list* children, int pid) {
+  struct list_elem* e;
+  for (e = list_begin(children); e != list_end(children); e = list_next(e)) {
+    struct shared_data* shared_data = list_entry(e, struct shared_data, elem);
+    if (shared_data->pid == pid) {
+      return shared_data;
+    }
+  }
+  return NULL;
 }
 
 /* Sets up the CPU for running user code in the current
@@ -289,6 +745,9 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
     goto done;
   }
 
+  file_deny_write(file);
+  t->pcb->executable = file;
+
   /* Read and verify executable header. */
   if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
       memcmp(ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 3 ||
@@ -358,7 +817,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
+  // file_close(file);
   return success;
 }
 

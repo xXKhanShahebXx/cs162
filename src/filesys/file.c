@@ -2,12 +2,14 @@
 #include <debug.h>
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include <stdbool.h>
 
 /* An open file. */
 struct file {
   struct inode* inode; /* File's inode. */
   off_t pos;           /* Current position. */
   bool deny_write;     /* Has file_deny_write() been called? */
+  int ref_count;
 };
 
 /* Opens a file for the given INODE, of which it takes ownership,
@@ -19,6 +21,7 @@ struct file* file_open(struct inode* inode) {
     file->inode = inode;
     file->pos = 0;
     file->deny_write = false;
+    file->ref_count = 1;
     return file;
   } else {
     inode_close(inode);
@@ -35,7 +38,11 @@ struct file* file_reopen(struct file* file) {
 
 /* Closes FILE. */
 void file_close(struct file* file) {
-  if (file != NULL) {
+  if (file == NULL)
+    return;
+
+  file->ref_count--;
+  if (file->ref_count == 0) {
     file_allow_write(file);
     inode_close(file->inode);
     free(file);
@@ -101,6 +108,8 @@ void file_deny_write(struct file* file) {
   }
 }
 
+bool writable(struct file* file) { return !file->deny_write; }
+
 /* Re-enables write operations on FILE's underlying inode.
    (Writes might still be denied by some other file that has the
    same inode open.) */
@@ -131,4 +140,11 @@ void file_seek(struct file* file, off_t new_pos) {
 off_t file_tell(struct file* file) {
   ASSERT(file != NULL);
   return file->pos;
+}
+
+struct file* file_dup(struct file* file) {
+  if (file == NULL)
+    return NULL;
+  file->ref_count++;
+  return file;
 }
