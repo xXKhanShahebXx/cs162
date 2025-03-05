@@ -20,16 +20,14 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
-/* Page-directory and page-table constants. */
-#define PDSHIFT 22 /* Log2(PTSIZE) */
-#define PTSHIFT 12 /* Log2(PGSIZE) */
-#define PTBITS 10  /* Log2(PTSIZE/PGSIZE) */
+#define PDSHIFT 22
+#define PTSHIFT 12
+#define PTBITS 10
 
-/* Page table/directory entry flags. */
-#define PTE_P 0x001         /* Present */
-#define PTE_W 0x002         /* Writable */
-#define PTE_U 0x004         /* User */
-#define PTE_ADDR 0xfffff000 /* Physical address (mask) */
+#define PTE_P 0x001
+#define PTE_W 0x002
+#define PTE_U 0x004
+#define PTE_ADDR 0xfffff000
 
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
