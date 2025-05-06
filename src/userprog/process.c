@@ -60,6 +60,7 @@ struct start_data {
   char* file_name;
   bool has_exec;
   struct list* children;
+  struct dir* cwd;
 };
 
 /* Starts a new thread running a user program loaded from
@@ -89,6 +90,7 @@ pid_t process_execute(const char* file_name) {
   sema_init(&(start_data.load), 0);
   start_data.children = &(thread_current()->pcb->children);
   start_data.has_exec = thread_current()->pcb->has_exec;
+  start_data.cwd = thread_current()->pcb->cwd;
 
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create(program_name, PRI_DEFAULT, start_process, &start_data);
@@ -148,6 +150,10 @@ static void start_process(void* start_data) {
     new_pcb->fd_table = new_fd;
     new_pcb->shared_data = new_shared_data;
     new_pcb->is_forked_child = false;
+    if (child_data->cwd != NULL)
+      new_pcb->cwd = dir_reopen(child_data->cwd);
+    else
+      new_pcb->cwd = dir_open_root();
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
@@ -345,6 +351,9 @@ void process_exit(void) {
     }
   }
 
+  if (pcb_to_free->cwd != NULL)
+    dir_close(pcb_to_free->cwd);
+
   cur->pcb = NULL;
   free(pcb_to_free);
   thread_exit();
@@ -394,6 +403,10 @@ static void start_fork_process(void* aux) {
   child->pcb->main_thread = child;
   strlcpy(child->pcb->process_name, child->name, sizeof child->name);
   child->pcb->is_forked_child = true;
+  if (parent->pcb->cwd != NULL)
+    child->pcb->cwd = dir_reopen(parent->pcb->cwd);
+  else
+    child->pcb->cwd = dir_open_root();
 
   child->pcb->fd_table = calloc(sizeof(struct fd_table), 1);
   if (child->pcb->fd_table == NULL)
@@ -445,7 +458,7 @@ static void start_fork_process(void* aux) {
       strlcpy(name_copy, parent_fd->file_name, strlen(parent_fd->file_name) + 1);
     }
 
-    struct fd* child_fd = add_fd(child->pcb->fd_table, child_file, name_copy);
+    struct fd* child_fd = add_fd(child->pcb->fd_table, child_file, NULL, name_copy);
     if (child_fd == NULL) {
       file_close(child_file);
       if (name_copy != NULL)
@@ -591,18 +604,19 @@ struct fd* find_fd(struct fd_table* fd_table, int fd_num) {
   return NULL;
 }
 
-struct fd* add_fd(struct fd_table* fd_table, struct file* file, char* file_name) {
-  if (file == NULL || fd_table == NULL) {
+struct fd* add_fd(struct fd_table* fd_table, struct file* file, struct dir* dir, const char* name) {
+  if (fd_table == NULL || (file == NULL && dir == NULL))
     return NULL;
-  }
-  struct fd* file_descriptor = calloc(sizeof(struct fd), 1);
-  struct list_elem* e = &(file_descriptor->list_fd);
-  file_descriptor->fd_num = fd_table->next_fd;
-  file_descriptor->file = file;
-  file_descriptor->file_name = file_name;
-  fd_table->next_fd++;
-  list_push_back(&(fd_table->fds), e);
-  return file_descriptor;
+  struct fd* fdesc = calloc(1, sizeof *fdesc);
+  if (!fdesc)
+    return NULL;
+  fdesc->fd_num = fd_table->next_fd++;
+  fdesc->file = file;
+  fdesc->dir = dir;
+  fdesc->is_dir = (dir != NULL);
+  fdesc->file_name = name;
+  list_push_back(&fd_table->fds, &fdesc->list_fd);
+  return fdesc;
 }
 
 int remove_fd(struct fd_table* fd_table, int fd) {

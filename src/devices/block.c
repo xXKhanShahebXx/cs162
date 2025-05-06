@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include "devices/ide.h"
 #include "threads/malloc.h"
+#include "threads/synch.h"
+#include "filesys/filesys.h"
+
+#define CACHE_SIZE 64
 
 /* A block device. */
 struct block {
@@ -19,6 +23,74 @@ struct block {
   unsigned long long read_cnt;  /* Number of sectors read. */
   unsigned long long write_cnt; /* Number of sectors written. */
 };
+
+struct cache_entry {
+  struct lock lock;
+  struct condition loaded;
+  bool valid;
+  bool dirty;
+  bool referenced;
+  bool loading;
+  block_sector_t sector;
+  uint8_t data[BLOCK_SECTOR_SIZE];
+};
+
+static struct cache_entry cache[CACHE_SIZE];
+static struct lock cache_lock;
+static size_t clock_hand;
+
+static int cache_evict(void) {
+  for (;;) {
+    struct cache_entry* e = &cache[clock_hand];
+    if (!e->valid) {
+      int victim = clock_hand;
+      clock_hand = (clock_hand + 1) % CACHE_SIZE;
+      return victim;
+    }
+    if (e->referenced) {
+      e->referenced = false;
+    } else {
+      int victim = clock_hand;
+      clock_hand = (clock_hand + 1) % CACHE_SIZE;
+      return victim;
+    }
+    clock_hand = (clock_hand + 1) % CACHE_SIZE;
+  }
+}
+
+static int cache_lookup(block_sector_t sector) {
+  for (int i = 0; i < CACHE_SIZE; i++)
+    if (cache[i].valid && cache[i].sector == sector)
+      return i;
+  return -1;
+}
+
+void block_cache_init(void) {
+  lock_init(&cache_lock);
+  clock_hand = 0;
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    lock_init(&cache[i].lock);
+    cond_init(&cache[i].loaded);
+    cache[i].valid = false;
+    cache[i].dirty = false;
+    cache[i].referenced = false;
+    cache[i].loading = false;
+  }
+}
+
+void block_cache_flush_all(void) {
+  lock_acquire(&cache_lock);
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    struct cache_entry* e = &cache[i];
+    lock_acquire(&e->lock);
+    if (e->valid && e->dirty) {
+      fs_device->ops->write(fs_device->aux, e->sector, e->data);
+      e->dirty = false;
+    }
+    lock_release(&e->lock);
+  }
+  lock_release(&cache_lock);
+}
 
 /* List of all block devices. */
 static struct list all_blocks = LIST_INITIALIZER(all_blocks);
@@ -96,7 +168,44 @@ static void check_sector(struct block* block, block_sector_t sector) {
    per-block device locking is unneeded. */
 void block_read(struct block* block, block_sector_t sector, void* buffer) {
   check_sector(block, sector);
-  block->ops->read(block->aux, sector, buffer);
+  if (block->type == BLOCK_FILESYS) {
+    lock_acquire(&cache_lock);
+    int idx = cache_lookup(sector);
+    if (idx != -1) {
+      struct cache_entry* e = &cache[idx];
+      lock_acquire(&e->lock);
+      while (e->loading)
+        cond_wait(&e->loaded, &e->lock);
+      e->referenced = true;
+      memcpy(buffer, e->data, BLOCK_SECTOR_SIZE);
+      lock_release(&e->lock);
+      lock_release(&cache_lock);
+    } else {
+      int victim = cache_evict();
+      struct cache_entry* e = &cache[victim];
+      lock_acquire(&e->lock);
+      if (e->valid && e->dirty) {
+        fs_device->ops->write(fs_device->aux, e->sector, e->data);
+        e->dirty = false;
+      }
+      e->valid = true;
+      e->dirty = false;
+      e->referenced = true;
+      e->loading = true;
+      e->sector = sector;
+      lock_release(&cache_lock);
+
+      fs_device->ops->read(fs_device->aux, sector, e->data);
+
+      e->loading = false;
+      cond_broadcast(&e->loaded, &e->lock);
+      memcpy(buffer, e->data, BLOCK_SECTOR_SIZE);
+      lock_release(&e->lock);
+    }
+  } else {
+    /* Non‑FS devices go straight to the driver */
+    block->ops->read(block->aux, sector, buffer);
+  }
   block->read_cnt++;
 }
 
@@ -108,7 +217,39 @@ void block_read(struct block* block, block_sector_t sector, void* buffer) {
 void block_write(struct block* block, block_sector_t sector, const void* buffer) {
   check_sector(block, sector);
   ASSERT(block->type != BLOCK_FOREIGN);
-  block->ops->write(block->aux, sector, buffer);
+  if (block->type == BLOCK_FILESYS) {
+    lock_acquire(&cache_lock);
+    int idx = cache_lookup(sector);
+    if (idx != -1) {
+      struct cache_entry* e = &cache[idx];
+      lock_acquire(&e->lock);
+      while (e->loading)
+        cond_wait(&e->loaded, &e->lock);
+      memcpy(e->data, buffer, BLOCK_SECTOR_SIZE);
+      e->dirty = true;
+      e->referenced = true;
+      lock_release(&e->lock);
+      lock_release(&cache_lock);
+    } else {
+      int victim = cache_evict();
+      struct cache_entry* e = &cache[victim];
+      lock_acquire(&e->lock);
+      if (e->valid && e->dirty) {
+        fs_device->ops->write(fs_device->aux, e->sector, e->data);
+      }
+      e->valid = true;
+      e->dirty = true;
+      e->referenced = true;
+      e->loading = false;
+      e->sector = sector;
+      memcpy(e->data, buffer, BLOCK_SECTOR_SIZE);
+      lock_release(&e->lock);
+      lock_release(&cache_lock);
+    }
+  } else {
+    /* Non‑FS devices go straight to the driver */
+    block->ops->write(block->aux, sector, buffer);
+  }
   block->write_cnt++;
 }
 

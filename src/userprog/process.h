@@ -35,6 +35,7 @@ struct process {
   bool has_exec;
   struct intr_frame if_save;
   bool is_forked_child;
+  struct dir* cwd;
 };
 
 struct shared_data {
@@ -56,6 +57,8 @@ struct fd {
   int fd_num;
   char* file_name;
   struct file* file;
+  struct dir* dir;
+  bool is_dir;
   struct list_elem list_fd;
 };
 
@@ -79,7 +82,7 @@ void pthread_exit_main(void);
 void init_table(struct fd_table* fd_table);
 void free_table(struct fd_table* fd_table);
 struct fd* find_fd(struct fd_table* fd_table, int fd_num);
-struct fd* add_fd(struct fd_table* fd_table, struct file* file, char* file_name);
+struct fd* add_fd(struct fd_table* fd_table, struct file* file, struct dir* dir, const char* name);
 int remove_fd(struct fd_table* fd_table, int fd);
 
 void init_shared_data(struct shared_data* shared_data);

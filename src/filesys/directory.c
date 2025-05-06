@@ -5,6 +5,8 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include "threads/thread.h"
+#include "userprog/process.h"
 
 /* A directory. */
 struct dir {
@@ -12,17 +14,18 @@ struct dir {
   off_t pos;           /* Current position. */
 };
 
-/* A single directory entry. */
-struct dir_entry {
-  block_sector_t inode_sector; /* Sector number of header. */
-  char name[NAME_MAX + 1];     /* Null terminated file name. */
-  bool in_use;                 /* In use or free? */
-};
-
 /* Creates a directory with space for ENTRY_CNT entries in the
    given SECTOR.  Returns true if successful, false on failure. */
 bool dir_create(block_sector_t sector, size_t entry_cnt) {
-  return inode_create(sector, entry_cnt * sizeof(struct dir_entry));
+  if (!inode_create(sector, entry_cnt * sizeof(struct dir_entry), true))
+    return false;
+  struct dir* d = dir_open(inode_open(sector));
+  if (d == NULL)
+    return false;
+  bool ok = dir_add(d, ".", sector) && dir_add(d, "..", ROOT_DIR_SECTOR);
+  dir_close(d);
+
+  return ok;
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -149,37 +152,58 @@ done:
   return success;
 }
 
+bool dir_is_empty(const struct dir* dir) {
+  struct dir_entry e;
+  off_t ofs = 0;
+  while (inode_read_at(dir->inode, &e, sizeof e, ofs) == sizeof e) {
+    ofs += sizeof e;
+    if (e.in_use && strcmp(e.name, ".") && strcmp(e.name, ".."))
+      return false;
+  }
+  return true;
+}
+
 /* Removes any entry for NAME in DIR.
    Returns true if successful, false on failure,
    which occurs only if there is no file with the given NAME. */
 bool dir_remove(struct dir* dir, const char* name) {
   struct dir_entry e;
   struct inode* inode = NULL;
-  bool success = false;
   off_t ofs;
+  bool success = false;
 
-  ASSERT(dir != NULL);
-  ASSERT(name != NULL);
-
-  /* Find directory entry. */
   if (!lookup(dir, name, &e, &ofs))
-    goto done;
+    return false;
 
-  /* Open inode. */
   inode = inode_open(e.inode_sector);
   if (inode == NULL)
-    goto done;
+    return false;
 
-  /* Erase directory entry. */
+  if (inode_is_dir(inode)) {
+    if (e.inode_sector == ROOT_DIR_SECTOR) {
+      inode_close(inode);
+      return false;
+    }
+
+    struct dir* dir = dir_open(inode);
+    bool is_empty = dir_is_empty(dir);
+    dir_close(dir);
+
+    if (!is_empty) {
+      inode_close(inode);
+      return false;
+    }
+  }
+
   e.in_use = false;
-  if (inode_write_at(dir->inode, &e, sizeof e, ofs) != sizeof e)
-    goto done;
+  if (inode_write_at(dir->inode, &e, sizeof e, ofs) != sizeof e) {
+    inode_close(inode);
+    return false;
+  }
 
-  /* Remove inode. */
   inode_remove(inode);
   success = true;
 
-done:
   inode_close(inode);
   return success;
 }
@@ -189,13 +213,81 @@ done:
    contains no more entries. */
 bool dir_readdir(struct dir* dir, char name[NAME_MAX + 1]) {
   struct dir_entry e;
-
   while (inode_read_at(dir->inode, &e, sizeof e, dir->pos) == sizeof e) {
     dir->pos += sizeof e;
-    if (e.in_use) {
+    if (e.in_use && strcmp(e.name, ".") != 0 && strcmp(e.name, "..") != 0) {
       strlcpy(name, e.name, NAME_MAX + 1);
       return true;
     }
   }
+  return false;
+}
+
+int get_next_part(char part[NAME_MAX + 1], const char** srcp) {
+  const char* src = *srcp;
+  char* dst = part;
+
+  while (*src == '/')
+    src++;
+  if (*src == '\0')
+    return 0;
+
+  while (*src != '/' && *src != '\0') {
+    if (dst < part + NAME_MAX)
+      *dst++ = *src;
+    else
+      return -1;
+    src++;
+  }
+  *dst = '\0';
+  *srcp = src;
+  return 1;
+}
+
+bool resolve_path(const char* path, struct dir** dir_out, char name_out[NAME_MAX + 1]) {
+  struct dir* cur;
+  if (path[0] == '/')
+    cur = dir_open_root();
+  else
+    cur = dir_reopen(thread_current()->pcb->cwd);
+
+  const char* src = path;
+  char part[NAME_MAX + 1];
+  int r;
+
+  while ((r = get_next_part(part, &src)) == 1) {
+    const char* peek = src;
+    char tmp[NAME_MAX + 1];
+    if (get_next_part(tmp, &peek) == 0) {
+      strlcpy(name_out, part, NAME_MAX + 1);
+      *dir_out = cur;
+      return true;
+    }
+
+    if (!strcmp(part, ".")) {
+    } else if (!strcmp(part, "..")) {
+      struct dir_entry e;
+      off_t ofs;
+      if (!lookup(cur, "..", &e, &ofs)) {
+        dir_close(cur);
+        return false;
+      }
+      struct dir* up = dir_open(inode_open(e.inode_sector));
+      dir_close(cur);
+      cur = up;
+    } else {
+      struct inode* inode = NULL;
+      if (!dir_lookup(cur, part, &inode) || !inode_is_dir(inode)) {
+        inode_close(inode);
+        dir_close(cur);
+        return false;
+      }
+      struct dir* next = dir_open(inode);
+      dir_close(cur);
+      cur = next;
+    }
+  }
+
+  dir_close(cur);
   return false;
 }
