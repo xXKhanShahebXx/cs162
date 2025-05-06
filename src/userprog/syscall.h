@@ -27,4 +27,8 @@ bool sys_mkdir(const char* path);
 bool sys_readdir(int fd, char* name);
 bool sys_isdir(int fd);
 
+void sys_buffer_cache_reset(void);
+void sys_buffer_cache_stats(int* hits, int* misses);
+void sys_block_device_stats(int* reads, int* writes);
+
 #endif /* userprog/syscall.h */

@@ -40,6 +40,10 @@ enum {
   SYS_READDIR, /* Reads a directory entry. */
   SYS_ISDIR,   /* Tests if a fd represents a directory. */
   SYS_INUMBER, /* Returns the inode number for a fd. */
+
+  SYS_BUFFER_CACHE_RESET,
+  SYS_BUFFER_CACHE_STATS,
+  SYS_BLOCK_DEVICE_STATS,
 };
 
 #endif /* lib/syscall-nr.h */

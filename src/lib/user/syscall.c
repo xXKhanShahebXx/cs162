@@ -158,3 +158,11 @@ void sema_up(sema_t* sema) {
 tid_t get_tid(void) { return syscall0(SYS_GET_TID); }
 
 pid_t fork(void) { return syscall0(SYS_FORK); }
+
+void buffer_cache_reset(void) { syscall0(SYS_BUFFER_CACHE_RESET); }
+
+void buffer_cache_stats(int* hits, int* misses) { syscall2(SYS_BUFFER_CACHE_STATS, hits, misses); }
+
+void block_device_stats(int* reads, int* writes) {
+  syscall2(SYS_BLOCK_DEVICE_STATS, reads, writes);
+}

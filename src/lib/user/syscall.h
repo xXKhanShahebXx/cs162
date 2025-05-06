@@ -65,4 +65,8 @@ int inumber(int fd);
 
 pid_t fork(void);
 
+void buffer_cache_reset(void);
+void buffer_cache_stats(int* hits, int* misses);
+void block_device_stats(int* reads, int* writes);
+
 #endif /* lib/user/syscall.h */

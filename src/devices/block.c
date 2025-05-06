@@ -38,6 +38,41 @@ struct cache_entry {
 static struct cache_entry cache[CACHE_SIZE];
 static struct lock cache_lock;
 static size_t clock_hand;
+static int cache_hits = 0;
+static int cache_misses = 0;
+
+void block_cache_reset(void) {
+  lock_acquire(&cache_lock);
+
+  cache_hits = 0;
+  cache_misses = 0;
+
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    struct cache_entry* e = &cache[i];
+    lock_acquire(&e->lock);
+    if (e->valid && e->dirty) {
+      fs_device->ops->write(fs_device->aux, e->sector, e->data);
+      e->dirty = false;
+    }
+
+    e->valid = false;
+    e->loading = false;
+    lock_release(&e->lock);
+  }
+
+  clock_hand = 0;
+
+  lock_release(&cache_lock);
+}
+
+void block_cache_get_stats(int* hits, int* misses) {
+  *hits = cache_hits;
+  *misses = cache_misses;
+}
+
+unsigned long long block_read_cnt(struct block* block) { return block->read_cnt; }
+
+unsigned long long block_write_cnt(struct block* block) { return block->write_cnt; }
 
 static int cache_evict(void) {
   for (;;) {
@@ -172,6 +207,7 @@ void block_read(struct block* block, block_sector_t sector, void* buffer) {
     lock_acquire(&cache_lock);
     int idx = cache_lookup(sector);
     if (idx != -1) {
+      cache_hits++;
       struct cache_entry* e = &cache[idx];
       lock_acquire(&e->lock);
       while (e->loading)
@@ -181,6 +217,7 @@ void block_read(struct block* block, block_sector_t sector, void* buffer) {
       lock_release(&e->lock);
       lock_release(&cache_lock);
     } else {
+      cache_misses++;
       int victim = cache_evict();
       struct cache_entry* e = &cache[victim];
       lock_acquire(&e->lock);

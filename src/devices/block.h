@@ -71,4 +71,12 @@ struct block* block_register(const char* name, enum block_type, const char* extr
 void block_cache_init(void);
 void block_cache_flush_all(void);
 
+void block_cache_reset(void);
+void block_cache_get_stats(int* hits, int* misses);
+
+unsigned long long block_read_cnt(struct block* block);
+unsigned long long block_write_cnt(struct block* block);
+void block_cache_reset(void);
+void block_cache_get_stats(int* hits, int* misses);
+
 #endif /* devices/block.h */

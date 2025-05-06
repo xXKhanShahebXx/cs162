@@ -131,6 +131,12 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     f->eax = sys_readdir(args[1], (char*)args[2]);
   } else if (args[0] == SYS_ISDIR) {
     f->eax = sys_isdir(args[1]);
+  } else if (args[0] == SYS_BUFFER_CACHE_RESET) {
+    sys_buffer_cache_reset();
+  } else if (args[0] == SYS_BUFFER_CACHE_STATS) {
+    sys_buffer_cache_stats((int*)args[1], (int*)args[2]);
+  } else if (args[0] == SYS_BLOCK_DEVICE_STATS) {
+    sys_block_device_stats((int*)args[1], (int*)args[2]);
   }
 }
 
@@ -441,4 +447,14 @@ bool sys_readdir(int fd, char* name) {
 bool sys_isdir(int fd) {
   struct fd* fdesc = find_fd(thread_current()->pcb->fd_table, fd);
   return fdesc && fdesc->is_dir;
+}
+
+void sys_buffer_cache_reset(void) { block_cache_reset(); }
+
+void sys_buffer_cache_stats(int* hits, int* misses) { block_cache_get_stats(hits, misses); }
+
+void sys_block_device_stats(int* reads, int* writes) {
+  struct block* fs_device = block_get_role(BLOCK_FILESYS);
+  *reads = (int)block_read_cnt(fs_device);
+  *writes = (int)block_write_cnt(fs_device);
 }
